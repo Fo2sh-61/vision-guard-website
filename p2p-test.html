@@ -197,15 +197,19 @@ $('startSend').onclick = async () => {
   });
   peer.on('error', e => setStatus('Introducer error: ' + e.type, 'bad'));
   peer.on('connection', conn => {
-    conn.on('open', () => {
-      setStatus('Phone found. Sending the picture…');
-      const call = peer.call(conn.peer, stream);
-      watchIce(call.peerConnection);
-      const tryCap = () => capBitrate(call.peerConnection);
-      call.peerConnection.addEventListener('connectionstatechange', tryCap);
-      setTimeout(tryCap, 1500);
-      watchStats(call.peerConnection, 'out');
-    });
+    // Call straight away: waiting for the note channel to open would itself
+    // need the direct link, and a failure there used to show nothing at all.
+    setStatus('Phone found. Trying to connect directly…');
+    const call = peer.call(conn.peer, stream);
+    watchIce(call.peerConnection);
+    const tryCap = () => capBitrate(call.peerConnection);
+    call.peerConnection.addEventListener('connectionstatechange', tryCap);
+    setTimeout(tryCap, 1500);
+    watchStats(call.peerConnection, 'out');
+    setTimeout(() => {
+      const s = call.peerConnection.iceConnectionState;
+      if (s !== 'connected' && s !== 'completed') setStatus('No direct link after 20 seconds: a network in between blocks it.', 'bad');
+    }, 20000);
   });
 };
 
@@ -224,6 +228,9 @@ $('startWatch').onclick = () => {
   peer.on('open', () => {
     peer.connect(PREFIX + code);
     setStatus('Found the introducer, waiting for the PC…');
+    setTimeout(() => {
+      if (!$('remote').srcObject) setStatus('No picture after 20 seconds: a network in between blocks the direct link.', 'bad');
+    }, 20000);
   });
   peer.on('call', call => {
     call.answer();
