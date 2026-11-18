@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>VisionGuard direct-link test</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --text:#e8eaf0; --dim:#9aa1b2; --ok:#2fbf71; --warn:#e5a50a; --bad:#e5484d; --accent:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 4px; }
+  p { color: var(--dim); margin: 6px 0; }
+  .card { background:var(--card); border-radius:12px; padding:16px; margin:12px 0; }
+  button { font:inherit; border:0; border-radius:10px; padding:12px 16px; background:var(--accent); color:#fff; cursor:pointer; width:100%; margin:6px 0; }
+  button.sec { background:#2a2f3a; }
+  input[type=text] { font:inherit; width:100%; padding:12px; border-radius:10px; border:1px solid #333a48; background:#11141a; color:var(--text); text-transform:uppercase; letter-spacing:4px; text-align:center; font-size:22px; }
+  label { display:flex; gap:8px; align-items:center; color:var(--dim); margin:8px 0; }
+  video { width:100%; background:#000; border-radius:10px; display:block; aspect-ratio:16/9; }
+  .code { font-size:40px; letter-spacing:8px; text-align:center; font-weight:700; margin:8px 0; }
+  .status { font-weight:600; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:6px 0; border-bottom:1px solid #262b35; }
+  td:last-child { text-align:right; font-variant-numeric: tabular-nums; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VisionGuard direct-link test</h1>
+  <p>Checks whether a phone on mobile data can see this PC's camera <b>directly</b>, without the video passing through any server.</p>
+
+  <section id="choose" class="card">
+    <button id="asSender">This is the PC (send the camera)</button>
+    <button id="asWatcher" class="sec">This is the phone (watch)</button>
+    <label><input type="checkbox" id="allowRelay"> Allow a relay if direct fails (for comparison only)</label>
+  </section>
+
+  <section id="sender" class="card hidden">
+    <label><input type="checkbox" id="pattern"> Use a moving test picture instead of the webcam</label>
+    <button id="startSend">Start</button>
+    <div id="codeBox" class="hidden">
+      <p>On the phone, open this page, tap "This is the phone" and type:</p>
+      <div class="code" id="code"></div>
+    </div>
+    <video id="preview" muted playsinline autoplay></video>
+  </section>
+
+  <section id="watcher" class="card hidden">
+    <input type="text" id="codeIn" maxlength="6" placeholder="CODE" autocomplete="off">
+    <button id="startWatch">Connect</button>
+    <video id="remote" muted playsinline autoplay></video>
+  </section>
+
+  <section class="card">
+    <div>Status: <span id="status" class="status">Choose PC or phone.</span></div>
+    <table id="stats" class="hidden">
+      <tr><td>Route</td><td id="sRoute">–</td></tr>
+      <tr><td>Picture size</td><td id="sSize">–</td></tr>
+      <tr><td>Pictures per second</td><td id="sFps">–</td></tr>
+      <tr><td>Speed now</td><td id="sRate">–</td></tr>
+      <tr><td>Data used so far</td><td id="sBytes">–</td></tr>
+      <tr><td>Time connected</td><td id="sTime">–</td></tr>
+    </table>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const PREFIX = 'vg-p2p-test-';
+const MAX_BITRATE = 500000;   // 500 kilobits per second, about a camera's small stream
+
+function setStatus(text, tone) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = 'status ' + (tone || '');
+}
+
+function config() {
+  // STUN only: it just tells each side its public address. No video passes through it.
+  const ice = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+  if ($('allowRelay').checked) {
+    ice.push({ urls: 'turn:eu-0.turn.peerjs.com:3478', username: 'peerjs', credential: 'peerjsp' });
+  }
+  return { config: { iceServers: ice } };
+}
+
+function newCode() {
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let c = '';
+  for (let i = 0; i < 6; i++) c += letters[Math.floor(Math.random() * letters.length)];
+  return c;
+}
+
+function testPattern() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 640; canvas.height = 360;
+  const g = canvas.getContext('2d');
+  let t = 0;
+  setInterval(() => {
+    t++;
+    g.fillStyle = '#123'; g.fillRect(0, 0, 640, 360);
+    g.fillStyle = '#3b82f6'; g.fillRect((t * 4) % 640, 140, 80, 80);
+    g.fillStyle = '#fff'; g.font = '28px sans-serif';
+    g.fillText('VisionGuard test ' + new Date().toLocaleTimeString(), 20, 50);
+  }, 66);
+  return canvas.captureStream(15);
+}
+
+// ---- statistics: which route, how big, how much data ----
+let statsTimer = null;
+function watchStats(pc, direction) {
+  $('stats').classList.remove('hidden');
+  const started = Date.now();
+  let lastBytes = 0, lastTime = Date.now();
+  clearInterval(statsTimer);
+  statsTimer = setInterval(async () => {
+    const report = await pc.getStats();
+    let pair = null, rtp = null;
+    const byId = {};
+    report.forEach(s => { byId[s.id] = s; });
+    report.forEach(s => {
+      if (s.type === 'transport' && s.selectedCandidatePairId) pair = byId[s.selectedCandidatePairId];
+      if (direction === 'in' && s.type === 'inbound-rtp' && s.kind === 'video') rtp = s;
+      if (direction === 'out' && s.type === 'outbound-rtp' && s.kind === 'video') rtp = s;
+    });
+    if (!pair) report.forEach(s => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s; });
+    if (pair) {
+      const l = byId[pair.localCandidateId], r = byId[pair.remoteCandidateId];
+      const relayed = (l && l.candidateType === 'relay') || (r && r.candidateType === 'relay');
+      $('sRoute').innerHTML = relayed
+        ? '<span class="warn">Through a relay server</span>'
+        : '<span class="ok">Direct (no server in the middle)</span>';
+    }
+    if (rtp) {
+      const bytes = direction === 'in' ? rtp.bytesReceived : rtp.bytesSent;
+      const now = Date.now();
+      const kbps = ((bytes - lastBytes) * 8 / 1000) / ((now - lastTime) / 1000);
+      lastBytes = bytes; lastTime = now;
+      $('sSize').textContent = rtp.frameWidth ? rtp.frameWidth + ' × ' + rtp.frameHeight + ' pixels' : '–';
+      $('sFps').textContent = rtp.framesPerSecond ? Math.round(rtp.framesPerSecond) + ' per second' : '–';
+      $('sRate').textContent = Math.max(0, Math.round(kbps)) + ' kilobits per second';
+      $('sBytes').textContent = (bytes / 1e6).toFixed(1) + ' MB';
+    }
+    const secs = Math.round((Date.now() - started) / 1000);
+    $('sTime').textContent = Math.floor(secs / 60) + ' min ' + (secs % 60) + ' s';
+  }, 1000);
+}
+
+function watchIce(pc) {
+  pc.addEventListener('iceconnectionstatechange', () => {
+    const s = pc.iceConnectionState;
+    if (s === 'connected' || s === 'completed') setStatus('Connected.', 'ok');
+    else if (s === 'checking') setStatus('Trying to connect directly…');
+    else if (s === 'failed') setStatus($('allowRelay').checked
+      ? 'Could not connect, even through the relay.'
+      : 'Could not connect directly: one of the two networks blocks it. Try again with "Allow a relay" ticked to compare.', 'bad');
+    else if (s === 'disconnected') setStatus('Connection lost.', 'warn');
+  });
+}
+
+function capBitrate(pc) {
+  pc.getSenders().forEach(sender => {
+    if (!sender.track || sender.track.kind !== 'video') return;
+    const p = sender.getParameters();
+    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    p.encodings[0].maxBitrate = MAX_BITRATE;
+    sender.setParameters(p).catch(() => {});
+  });
+}
+
+// ---- PC side ----
+$('asSender').onclick = () => { $('choose').classList.add('hidden'); $('sender').classList.remove('hidden'); setStatus('Press Start.'); };
+$('startSend').onclick = async () => {
+  $('startSend').disabled = true;
+  let stream;
+  try {
+    stream = $('pattern').checked
+      ? testPattern()
+      : await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360, frameRate: 15 }, audio: false });
+  } catch (e) {
+    setStatus('Could not open the webcam: ' + e.message, 'bad');
+    $('startSend').disabled = false;
+    return;
+  }
+  $('preview').srcObject = stream;
+  const code = newCode();
+  setStatus('Registering with the introducer…');
+  const peer = new Peer(PREFIX + code, config());
+  peer.on('open', () => {
+    $('code').textContent = code;
+    $('codeBox').classList.remove('hidden');
+    setStatus('Waiting for the phone…');
+  });
+  peer.on('error', e => setStatus('Introducer error: ' + e.type, 'bad'));
+  peer.on('connection', conn => {
+    conn.on('open', () => {
+      setStatus('Phone found. Sending the picture…');
+      const call = peer.call(conn.peer, stream);
+      watchIce(call.peerConnection);
+      const tryCap = () => capBitrate(call.peerConnection);
+      call.peerConnection.addEventListener('connectionstatechange', tryCap);
+      setTimeout(tryCap, 1500);
+      watchStats(call.peerConnection, 'out');
+    });
+  });
+};
+
+// ---- phone side ----
+$('asWatcher').onclick = () => { $('choose').classList.add('hidden'); $('watcher').classList.remove('hidden'); setStatus('Type the code shown on the PC.'); };
+$('startWatch').onclick = () => {
+  const code = $('codeIn').value.trim().toUpperCase();
+  if (code.length !== 6) { setStatus('The code has 6 letters.', 'warn'); return; }
+  $('startWatch').disabled = true;
+  setStatus('Asking the introducer for the PC…');
+  const peer = new Peer(config());
+  peer.on('error', e => {
+    setStatus(e.type === 'peer-unavailable' ? 'No PC with that code. Check the code.' : 'Introducer error: ' + e.type, 'bad');
+    $('startWatch').disabled = false;
+  });
+  peer.on('open', () => {
+    peer.connect(PREFIX + code);
+    setStatus('Found the introducer, waiting for the PC…');
+  });
+  peer.on('call', call => {
+    call.answer();
+    watchIce(call.peerConnection);
+    call.on('stream', s => { $('remote').srcObject = s; $('remote').play().catch(() => {}); });
+    watchStats(call.peerConnection, 'in');
+  });
+};
+</script>
+</body>
+</html>
